@@ -7,7 +7,6 @@ import scipy.stats as stats
 from sklearn import linear_model
 import timeit
 from geopy.geocoders import Nominatim
-from flask import app
 import sklearn.preprocessing as preprocessing
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
@@ -643,8 +642,103 @@ def fit_models(d_origin,):
     #print train_mae,test_mae,reg.score(train_in,train_out),reg.score(test_in,test_out)
     return reg,nn, train_in, train_out,test_in,test,out
 
+def make_simulation_data(d_in,lags=1,degree=2,local_factor=1,global_factor=1):
+    #make training and testing splits from dataframe for fitting, also generates timelags and polynomial features
+    df=d_in.copy()
+    df_unlag=d_in.copy()
+    df_unlag['local_traffic']=df_unlag['local_traffic']*local_factor
+    df_unlag['total_traffic']=df_unlag['total_traffic']*global_factor
+    
+    #features to use for fitting, only some with have lags
+    lag_features=['value','var','Humidity', 
+                  'TempMax',  'TempMin','Wind_v', 
+                  'Wind_x','Precip','Wind_y','local_traffic','total_traffic']
+    features=['Consumption_Oil','Consumption_Gas']
+    
+    #Binary data features
+    days = ['Mon', 'Tues', 'Wed', 'Thurs', 'Fri', 'Sat', 'Sun']
+    months= ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sept','Oct','Nov','Dec'];
+    locations=['loc'+str(x) for x in range(1,16)]
+    
+    #get binary data as day of week, month of year, and location index
+    bin_data=np.array([df.index.dayofweek, df.index.month-1, df['location']-1]).T
+    bin_data_label=days+months+locations
+    
+    # convert to binary features
+    enc=preprocessing.OneHotEncoder(n_values=[7, 12, 15])
+    enc.fit(bin_data)
+    bin_data=enc.transform(bin_data).toarray()
+
+    
+    poly = preprocessing.PolynomialFeatures(degree,interaction_only=True,include_bias=False)
+    
+    #start with more static data
+    input_data=df[features].as_matrix()
+    
+    #add todays features, ignoring info about pollution
+    lag_data0=df_unlag[lag_features[2:]].as_matrix()
+    
+    #add lag features and higher order lag features
+    lag_data0_=poly.fit_transform(lag_data0)
+    
+    #combine all data before lags
+    input_data=np.concatenate((lag_data0_,input_data,bin_data),axis=1)
+
+    #construct datalabels 
+    cross_features=polynomial_labels(lag_features[2:],degree)
+    cross_features_lag=polynomial_labels(lag_features,degree)
+    data_labels=cross_features+features+bin_data_label
+    
+    
+    #add time lags
+    location_list=df['location'].unique()
+    for i_lag in range(1,lags+1):
+        df_temp=df.copy()
+        
+        #have to be careful about adding time lags, we go through each location
+        for location in location_list:
+            #seperate current location from others
+            df_loc=df_temp[df_temp['location']==location]
+            df_not_loc=df_temp[df_temp['location']!=location]
+            
+            #shift index for current location, and then shift index back 
+            df_loc.index=df_loc.index- pd.DateOffset(1)
+            df_loc=df_loc.ix[df_loc.index +pd.DateOffset(1)]
+            #fix location after shifting
+            df_loc['location']=location
+            #add back current location
+            df_temp=df_not_loc.append(df_loc)
+        
+        #poly transform fails with nans
+        #temporarily fill nans with -999, get poly features,  then remove them later
+        df_temp=df_temp.fillna(-999)
+        lag_data0=df_temp[lag_features].as_matrix()
+        lag_data0_=poly.fit_transform(lag_data0)
+        lag_data0_[lag_data0_==-999]=np.nan
+        
+        #add lag features to current input data
+        input_data=np.concatenate((lag_data0_,input_data),axis=1)
+        
+        #add labels lags
+        lag_label=[x+'lag'+str(i_lag) for x in cross_features_lag]
+        data_labels=lag_label+data_labels
+    
+    #get all labels
+    labels=df.columns;
+
+    #kill off nans
+    output_data=df['value'].as_matrix()
+    good_row=-np.isnan(input_data).any(axis=1)
+    input_data=input_data[good_row,:]
+    
+    #remove bad rows, but keep track of where we did it
+    output_data=output_data[good_row]
+    return input_data,output_data,good_row,data_labels
+
+
+
 def run_experiment(df,reg,local_factor=1,global_factor=1,lags=5,degree=2):
-    #run model with simulated traffic levels, adding column for current prediction, simulated result, and difference
+     #run model with simulated traffic levels, adding column for current prediction, simulated result, and difference
     
     d_exp_all=pd.DataFrame()
     
@@ -661,9 +755,10 @@ def run_experiment(df,reg,local_factor=1,global_factor=1,lags=5,degree=2):
             predicted_in,__,good_row,__=make_training_data(d_exp,lags=lags,degree=degree)
             
             #simulate reduced traffic and get model inputs
-            d_exp['local_traffic']=d_exp['local_traffic']*local_factor
-            d_exp['total_traffic']=d_exp['total_traffic']*global_factor
-            experiment_in,__,good_row,labels=make_training_data(d_exp,lags=lags,degree=degree)
+            #d_exp['local_traffic']=d_exp['local_traffic']*local_factor
+            #d_exp['total_traffic']=d_exp['total_traffic']*global_factor
+            experiment_in,__,good_row,labels=make_simulation_data(
+                d_exp,lags=lags,degree=degree,local_factor=local_factor,global_factor=global_factor)
 
             #clean up shape by indexing
             predicted_out=np.zeros(good_row.shape[0])*np.nan
